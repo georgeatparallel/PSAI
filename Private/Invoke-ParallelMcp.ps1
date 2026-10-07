@@ -16,7 +16,7 @@ function Invoke-ParallelMcpRequest {
             $timeoutOptions['OperationTimeoutSeconds'] = $TimeoutSec
         }
         $response = Invoke-WebRequest -Uri 'https://search.parallel.ai/mcp' -Method Post `
-            -ContentType 'application/json' -Headers $Headers `
+            -ContentType 'application/json; charset=utf-8' -Headers $Headers `
             -UserAgent "PSAI/$($ExecutionContext.SessionState.Module.Version) (https://github.com/dfinke/PSAI)" `
             -Body ($Message | ConvertTo-Json -Depth 20 -Compress) @timeoutOptions -ErrorAction Stop
 

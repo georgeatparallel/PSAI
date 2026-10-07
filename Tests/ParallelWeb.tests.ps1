@@ -2,6 +2,93 @@ BeforeDiscovery {
     Import-Module "$PSScriptRoot/../PSAI.psd1" -Force
 }
 
+Describe 'Parallel MCP HTTP encoding' {
+    InModuleScope PSAI {
+        It 'sends Unicode objectives and queries as UTF-8 bytes over HTTP' {
+            # Redirect only the destination; the real cmdlet serializes the body.
+            $portReservation = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+            $portReservation.Start()
+            $script:loopbackUri = "http://127.0.0.1:$($portReservation.LocalEndpoint.Port)/"
+            $portReservation.Stop()
+            $readyPath = Join-Path $TestDrive 'listener-ready'
+            $server = Start-Job -ArgumentList $script:loopbackUri, $readyPath -ScriptBlock {
+                param($Uri, $ReadyPath)
+                $listener = [System.Net.HttpListener]::new()
+                $listener.Prefixes.Add($Uri)
+                try {
+                    $listener.Start()
+                    Set-Content -Path $ReadyPath -Value 'ready'
+                    foreach ($requestNumber in 1..3) {
+                        $pending = $listener.BeginGetContext($null, $null)
+                        if (-not $pending.AsyncWaitHandle.WaitOne(20000)) { throw 'Local HTTP request timed out.' }
+                        $context = $listener.EndGetContext($pending)
+                        $buffer = [System.IO.MemoryStream]::new()
+                        try {
+                            $context.Request.InputStream.CopyTo($buffer)
+                            [pscustomobject]@{
+                                BodyBase64 = [Convert]::ToBase64String($buffer.ToArray())
+                                ContentType = $context.Request.ContentType
+                                UserAgent = $context.Request.UserAgent
+                                Authorization = $context.Request.Headers['Authorization']
+                                ApiKey = $context.Request.Headers['x-api-key']
+                            }
+                        }
+                        finally { $buffer.Dispose() }
+                        $reply = switch ($requestNumber) {
+                            1 { '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}' }
+                            2 { '' }
+                            3 { '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Unicode search received"}]}}' }
+                        }
+                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($reply)
+                        $context.Response.ContentType = 'application/json; charset=utf-8'
+                        $context.Response.ContentLength64 = $responseBytes.Length
+                        $context.Response.OutputStream.Write($responseBytes, 0, $responseBytes.Length)
+                        $context.Response.Close()
+                    }
+                }
+                finally { $listener.Close() }
+            }
+            try {
+                $deadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path $readyPath) -and [DateTime]::UtcNow -lt $deadline) {
+                    Start-Sleep -Milliseconds 50
+                }
+                Test-Path $readyPath | Should -BeTrue
+                $script:realWebRequest = Get-Command Microsoft.PowerShell.Utility\Invoke-WebRequest
+                Mock Invoke-WebRequest {
+                    param($Uri, $Method, $ContentType, $Headers, $UserAgent, $Body, $TimeoutSec, $ConnectionTimeoutSeconds, $OperationTimeoutSeconds)
+                    $forward = @{} + $PSBoundParameters
+                    $forward['Uri'] = $script:loopbackUri
+                    & $script:realWebRequest @forward
+                }
+                Search-ParallelWeb -Objective '東京 café' -SearchQueries '東京 café' | Should -Be 'Unicode search received'
+                $null = Wait-Job $server -Timeout 10
+                $server.State | Should -Be 'Completed'
+                $requests = @(Receive-Job $server -ErrorAction Stop)
+                $requests.Count | Should -Be 3
+                $bytes = [Convert]::FromBase64String($requests[2].BodyBase64)
+                # Assert the wire bytes, then decode strictly before parsing JSON.
+                ([BitConverter]::ToString($bytes)) | Should -Match 'E6-9D-B1-E4-BA-AC-20-63-61-66-C3-A9'
+                $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+                $arguments = ($utf8.GetString($bytes) | ConvertFrom-Json).params.arguments
+                $arguments.objective | Should -Be '東京 café'
+                $arguments.search_queries[0] | Should -Be '東京 café'
+                foreach ($request in $requests) {
+                    $request.ContentType | Should -Be 'application/json; charset=utf-8'
+                    $request.UserAgent | Should -Be "PSAI/$((Get-Module PSAI).Version) (https://github.com/dfinke/PSAI)"
+                    $request.Authorization | Should -BeNullOrEmpty
+                    $request.ApiKey | Should -BeNullOrEmpty
+                }
+
+            }
+            finally {
+                Stop-Job $server
+                Remove-Job $server -Force
+            }
+        }
+    }
+}
+
 Describe 'Parallel MCP tools' {
     InModuleScope PSAI {
         BeforeEach {
@@ -56,7 +143,7 @@ Describe 'Parallel MCP tools' {
             foreach ($request in $script:requests) {
                 $request.Uri | Should -Be 'https://search.parallel.ai/mcp'
                 $request.Method | Should -Be 'Post'
-                $request.ContentType | Should -Be 'application/json'
+                $request.ContentType | Should -Be 'application/json; charset=utf-8'
                 $request.UserAgent | Should -Be "PSAI/$((Get-Module PSAI).Version) (https://github.com/dfinke/PSAI)"
                 $request.TimeoutSec | Should -Be 17
                 if ((Get-Command Microsoft.PowerShell.Utility\Invoke-WebRequest).Parameters.ContainsKey('OperationTimeoutSeconds')) {
